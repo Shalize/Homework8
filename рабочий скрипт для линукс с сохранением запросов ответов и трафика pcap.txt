@@ -1,0 +1,128 @@
+import zlib
+from scapy.all import sniff, Raw, wrpcap
+from datetime import datetime
+import json
+import os
+import signal
+import sys
+
+# Настройки имен файлов
+json_filename = 'gruyere_traffic.json'
+pcap_filename = 'gruyere_capture.pcap'
+
+transactions = []
+all_packets = []  # Список для хранения пакетов для PCAP
+pending_request = None
+
+def decompress_gzip(data):
+    try:
+        return zlib.decompress(data, 15 + 32).decode('utf-8', errors='ignore')
+    except:
+        return None
+
+def analyze_packet(packet):
+    global pending_request, all_packets
+    
+    if not packet.haslayer(Raw):
+        return
+    
+    # Сохраняем пакет для последующей записи в PCAP
+    all_packets.append(packet)
+    
+    payload = packet[Raw].load
+    
+    try:
+        # --- ЛОГИКА ЗАПРОСА ---
+        if any(payload.startswith(v) for v in [b'GET', b'POST', b'PUT', b'DELETE']):
+            decoded = payload.decode('utf-8', errors='ignore')
+            req_line = decoded.split('\r\n')[0] # Берем только первую строку
+            
+            pending_request = {
+                'request': req_line,
+                'request_time': datetime.now().isoformat()
+            }
+            print(f"[➔] REQ: {req_line}")
+
+        # --- ЛОГИКА ОТВЕТА ---
+        elif payload.startswith(b'HTTP/1.'):
+            parts = payload.split(b'\r\n\r\n', 1)
+            header_raw = parts[0].decode('utf-8', errors='ignore')
+            status_line = header_raw.split('\r\n')[0]
+            
+            body_content = ""
+            if len(parts) > 1:
+                raw_body = parts[1]
+                if b'Content-Encoding: gzip' in parts[0] or b'\x1f\x8b' in raw_body:
+                    decompressed = decompress_gzip(raw_body)
+                    body_content = decompressed if decompressed else "[Gzip Compression]"
+                else:
+                    body_content = raw_body.decode('utf-8', errors='ignore')
+
+            transaction = {}
+            if pending_request:
+                transaction = {
+                    **pending_request,
+                    'response': status_line,
+                    'response_body': body_content[:3000],
+                    'response_time': datetime.now().isoformat()
+                }
+                pending_request = None
+            else:
+                transaction = {
+                    'request': "Unknown (captured mid-session)",
+                    'response': status_line,
+                    'response_body': body_content[:3000],
+                    'response_time': datetime.now().isoformat()
+                }
+
+            transactions.append(transaction)
+            print(f"[⇜] RES: {status_line}")
+            
+    except Exception:
+        pass
+
+def save_data():
+    global transactions, all_packets
+    
+    # 1. Сохранение в JSON
+    if transactions:
+        existing_data = []
+        if os.path.exists(json_filename):
+            try:
+                with open(json_filename, 'r', encoding='utf-8') as f:
+                    content = json.load(f)
+                    existing_data = content if isinstance(content, list) else content.get('transactions', [])
+            except: pass
+
+        existing_data.extend(transactions)
+        with open(json_filename, 'w', encoding='utf-8') as f:
+            json.dump(existing_data, f, indent=2, ensure_ascii=False)
+        print(f"\n[💾] JSON обновлен: {len(existing_data)} транзакций.")
+
+    # 2. Сохранение в PCAP
+    if all_packets:
+        try:
+            # append=True позволяет дописывать в файл, если он уже есть
+            wrpcap(pcap_filename, all_packets, append=True)
+            print(f"[🛡️] Трафик сохранен в {pcap_filename} (откройте в Wireshark)")
+        except Exception as e:
+            print(f"[❌] Ошибка записи PCAP: {e}")
+
+    transactions = []
+    all_packets = []
+
+def signal_handler(sig, frame):
+    print("\n[!] Остановка... Сохраняю данные...")
+    save_data()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+print("="*50)
+print("Сбор данных запущен!")
+print(f"JSON: {json_filename}")
+print(f"PCAP: {pcap_filename}")
+print("Нажми Ctrl+C для завершения.")
+print("="*50)
+
+sniff(prn=analyze_packet, filter="tcp port 80 or tcp port 8008", store=False)
